@@ -1,10 +1,22 @@
 {
   "name": "openclaw-manager",
   "version": "0.0.7",
-  "description": "🦞 OpenClaw 跨平台管理工具 - 高性能 AI 助手配置与服务管理",
+  "description": "Awesome OpenClaw Manager for Windows and WSL2, with multi-gateway dashboard, Telegram bot management, Discord gateway support, and Control Center integration.",
   "author": "OpenClaw Team",
   "license": "MIT",
   "type": "module",
+  "keywords": [
+    "openclaw",
+    "openclaw-manager",
+    "windows",
+    "wsl2",
+    "telegram-bot",
+    "discord-bot",
+    "gateway",
+    "tauri",
+    "react",
+    "rust"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
