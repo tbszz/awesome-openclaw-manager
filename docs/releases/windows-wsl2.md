@@ -1,5 +1,7 @@
 # Awesome OpenClaw Manager Windows + WSL2 完整部署版
 
+[English](windows-wsl2.en.md) | [中文](windows-wsl2.md)
+
 Windows + WSL2 完整部署版适合“在 Windows 桌面上使用 Manager，同时把 OpenClaw gateway 和 bot 运行在 Ubuntu 子系统里”的场景。这是当前仓库最完整、最实用、最贴近真实生产环境的版本。
 
 关键词：OpenClaw WSL2 部署、OpenClaw Windows Ubuntu 子系统、OpenClaw 多 Gateway 管理、Telegram Bot Gateway、Discord Bot Gateway。
@@ -23,6 +25,7 @@ Windows + WSL2 完整部署版适合“在 Windows 桌面上使用 Manager，同
 - `scripts/windows-proxy-bridge.mjs`
 - `README.md`
 - `manager-ui.png`
+- `manager-ui-en.png`
 
 ## 环境要求
 

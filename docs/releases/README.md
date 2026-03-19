@@ -1,5 +1,7 @@
 # Awesome OpenClaw Manager 发布版本说明
 
+[English](README.en.md) | [中文](README.md)
+
 Awesome OpenClaw Manager 当前整理为两个下载版本，分别服务两类不同的 OpenClaw 部署需求。
 
 ## 1. Windows 本地桌面版

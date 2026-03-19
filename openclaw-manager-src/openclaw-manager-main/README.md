@@ -9,8 +9,10 @@
 
 如果你想看项目介绍、两个发布版本说明和下载方式，优先阅读根目录文档：
 
-- [../../README.md](../../README.md)
-- [../../docs/releases/README.md](../../docs/releases/README.md)
+- [English README](../../README.md)
+- [中文 README](../../README.zh-CN.md)
+- [English Release Guide](../../docs/releases/README.en.md)
+- [中文版本说明](../../docs/releases/README.md)
 
 ## 目录说明
 

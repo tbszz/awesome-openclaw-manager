@@ -1,5 +1,7 @@
 # Awesome OpenClaw Manager Windows 本地桌面版
 
+[English](windows-local.en.md) | [中文](windows-local.md)
+
 Windows 本地桌面版适合“先把 OpenClaw Manager 桌面程序装到 Windows 本机上”的场景。这个版本强调的是本地桌面安装和轻量交付，不额外附带整套 WSL2 部署脚本。
 
 关键词：OpenClaw Windows 管理器、OpenClaw 桌面版、OpenClaw 本地部署、OpenClaw bot 面板。
@@ -16,6 +18,7 @@ Windows 本地桌面版适合“先把 OpenClaw Manager 桌面程序装到 Windo
 - `WebView2Loader.dll`
 - `README.md`
 - `manager-ui.png`
+- `manager-ui-en.png`
 
 ## 安装方式
 
