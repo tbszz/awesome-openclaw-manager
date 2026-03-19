@@ -10,7 +10,7 @@
 
 关键词：OpenClaw Manager、OpenClaw 多 Gateway、Windows OpenClaw 部署、WSL2 OpenClaw 部署、Telegram Bot 管理面板、Discord Bot Gateway、OpenClaw Workbench、OpenClaw Control Center、Tauri、React、Rust。
 
-[Releases 下载页](https://github.com/tbszz/awesome-openclaw-manager/releases) | [两个版本说明](docs/releases/README.md) | [Windows 本地桌面版](docs/releases/windows-local.md) | [Windows + WSL2 完整部署版](docs/releases/windows-wsl2.md)
+[Releases 下载页](https://github.com/tbszz/awesome-openclaw-manager/releases) | [两个版本说明](docs/releases/README.md) | [Windows 本地桌面版](https://github.com/tbszz/awesome-openclaw-manager/releases/tag/v0.0.7-windows-local) | [Windows + WSL2 完整部署版](https://github.com/tbszz/awesome-openclaw-manager/releases/tag/v0.0.7-windows-wsl2)
 
 ## 项目截图
 
@@ -107,8 +107,9 @@ flowchart LR
 
 下载方式：
 
-- 访问 [GitHub Releases](https://github.com/tbszz/awesome-openclaw-manager/releases)
-- 根据你的部署目标选择本地桌面版或 WSL2 完整部署版
+- [下载 Windows 本地桌面版](https://github.com/tbszz/awesome-openclaw-manager/releases/tag/v0.0.7-windows-local)
+- [下载 Windows + WSL2 完整部署版](https://github.com/tbszz/awesome-openclaw-manager/releases/tag/v0.0.7-windows-wsl2)
+- [查看全部 Releases](https://github.com/tbszz/awesome-openclaw-manager/releases)
 
 ## 快速开始
 
