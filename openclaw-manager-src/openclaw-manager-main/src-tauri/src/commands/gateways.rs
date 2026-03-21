@@ -263,6 +263,14 @@ pub async fn ensure_control_center(gateway_id: String) -> Result<ControlCenterSt
     let repo_path = find_control_center_repo();
     let runtime_dir = control_center_runtime_dir(&gateway.id);
     let runtime_dir_string = runtime_dir.display().to_string();
+    let (stdout_log_path, stderr_log_path) = control_center_log_paths(&gateway.id);
+    let diagnostics = control_center_diagnostics(
+        &gateway,
+        ui_port,
+        &runtime_dir,
+        &stdout_log_path,
+        &stderr_log_path,
+    );
     let status = build_control_center_status(
         ui_port,
         repo_path.as_ref(),
@@ -273,19 +281,29 @@ pub async fn ensure_control_center(gateway_id: String) -> Result<ControlCenterSt
     }
 
     let repo_path = repo_path.ok_or_else(|| {
-        "OpenClaw Control Center repo was not found. Expected OPENCLAW_CONTROL_CENTER_PATH or a local openclaw-control-center checkout.".to_string()
+        format!(
+            "OpenClaw Control Center repo was not found. Expected OPENCLAW_CONTROL_CENTER_PATH or a local openclaw-control-center checkout. {}",
+            diagnostics
+        )
     })?;
 
     if is_local_port_open(status.ui_port) && !status.ready {
         return Err(format!(
-            "Control Center port {} is occupied by another process and is not responding as a control center.",
-            status.ui_port
+            "Control Center port {} is occupied by another process and is not responding as a control center. {}",
+            status.ui_port, diagnostics
         ));
     }
 
     spawn_control_center_process(&gateway, &repo_path, &runtime_dir, status.ui_port)?;
 
-    wait_for_control_center(status.ui_port, Duration::from_secs(25))?;
+    wait_for_control_center(
+        &gateway,
+        status.ui_port,
+        &runtime_dir,
+        &stdout_log_path,
+        &stderr_log_path,
+        Duration::from_secs(25),
+    )?;
 
     Ok(build_control_center_status(
         ui_port,
@@ -419,7 +437,7 @@ fn build_manager_state(manifest: &GatewayManifest) -> Result<ManagerState, Strin
             let ui_port = control_center_ports
                 .get(&gateway.id)
                 .copied()
-                .unwrap_or(CONTROL_CENTER_DYNAMIC_PORT_START);
+                .unwrap_or_else(|| preferred_control_center_port(manifest, &gateway.id));
             let service = read_gateway_service_runtime(gateway);
             let config = read_gateway_config(gateway);
             let health = health_map.get(&gateway.id).cloned().unwrap_or_default();
@@ -1668,6 +1686,32 @@ fn control_center_runtime_dir(gateway_id: &str) -> PathBuf {
         .join(gateway_id)
 }
 
+fn control_center_log_paths(gateway_id: &str) -> (PathBuf, PathBuf) {
+    let log_dir = manager_runtime_dir().join("logs");
+    (
+        log_dir.join(format!("control-center-{}.stdout.log", gateway_id)),
+        log_dir.join(format!("control-center-{}.stderr.log", gateway_id)),
+    )
+}
+
+fn control_center_diagnostics(
+    gateway: &ManifestGateway,
+    ui_port: u16,
+    runtime_dir: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> String {
+    format!(
+        "gateway_id={}, gateway_port={}, ui_port={}, runtime_dir={}, stdout_log={}, stderr_log={}",
+        gateway.id,
+        gateway.port,
+        ui_port,
+        runtime_dir.display(),
+        stdout_path.display(),
+        stderr_path.display()
+    )
+}
+
 fn manager_runtime_dir() -> PathBuf {
     if let Some(local_data) = dirs::data_local_dir() {
         return local_data.join("OpenClawManager");
@@ -1716,24 +1760,35 @@ fn spawn_control_center_process(
     runtime_dir: &Path,
     ui_port: u16,
 ) -> Result<(), String> {
-    fs::create_dir_all(runtime_dir)
-        .map_err(|error| format!("Failed to create control center runtime dir: {}", error))?;
     let log_dir = manager_runtime_dir().join("logs");
-    fs::create_dir_all(&log_dir)
-        .map_err(|error| format!("Failed to create log directory: {}", error))?;
+    let (stdout_path, stderr_path) = control_center_log_paths(&gateway.id);
+    let diagnostics = control_center_diagnostics(
+        gateway,
+        ui_port,
+        runtime_dir,
+        &stdout_path,
+        &stderr_path,
+    );
 
-    let stdout_path = log_dir.join(format!("control-center-{}.stdout.log", gateway.id));
-    let stderr_path = log_dir.join(format!("control-center-{}.stderr.log", gateway.id));
+    fs::create_dir_all(runtime_dir).map_err(|error| {
+        format!(
+            "Failed to create control center runtime dir: {}. {}",
+            error, diagnostics
+        )
+    })?;
+    fs::create_dir_all(&log_dir)
+        .map_err(|error| format!("Failed to create log directory: {}. {}", error, diagnostics))?;
+
     let stdout_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&stdout_path)
-        .map_err(|error| format!("Failed to open control center stdout log: {}", error))?;
+        .map_err(|error| format!("Failed to open control center stdout log: {}. {}", error, diagnostics))?;
     let stderr_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&stderr_path)
-        .map_err(|error| format!("Failed to open control center stderr log: {}", error))?;
+        .map_err(|error| format!("Failed to open control center stderr log: {}. {}", error, diagnostics))?;
 
     let mut command = Command::new("cmd");
     command.args(["/c", "npm.cmd", "run", "dev:ui"]);
@@ -1769,14 +1824,24 @@ fn spawn_control_center_process(
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
 
-    command
-        .spawn()
-        .map_err(|error| format!("Failed to start control center: {}", error))?;
+    command.spawn().map_err(|error| {
+        format!(
+            "Failed to start control center: {}. {}",
+            error, diagnostics
+        )
+    })?;
 
     Ok(())
 }
 
-fn wait_for_control_center(port: u16, timeout: Duration) -> Result<(), String> {
+fn wait_for_control_center(
+    gateway: &ManifestGateway,
+    port: u16,
+    runtime_dir: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
     let started_at = Instant::now();
     while started_at.elapsed() < timeout {
         if control_center_ready(port) {
@@ -1786,8 +1851,9 @@ fn wait_for_control_center(port: u16, timeout: Duration) -> Result<(), String> {
     }
 
     Err(format!(
-        "Control Center on port {} did not become ready in time.",
-        port
+        "Control Center on port {} did not become ready in time. {}",
+        port,
+        control_center_diagnostics(gateway, port, runtime_dir, stdout_path, stderr_path)
     ))
 }
 
@@ -1994,4 +2060,81 @@ fn normalize_log_lines(lines: Vec<String>, count: usize) -> Vec<String> {
     }
 
     normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_gateway(id: &str, port: u16) -> ManifestGateway {
+        ManifestGateway {
+            id: id.to_string(),
+            label: id.to_string(),
+            profile: Some(format!("profile-{}", id)),
+            service_name: format!("openclaw-gateway-{}.service", id),
+            state_dir: format!("/root/.openclaw-{}", id),
+            workspace_dir: format!("/root/.openclaw-{}/workspace", id),
+            port,
+            browser_profile: None,
+        }
+    }
+
+    fn test_manifest(ids_and_ports: &[(&str, u16)]) -> GatewayManifest {
+        GatewayManifest {
+            generated_at: None,
+            gateways: ids_and_ports
+                .iter()
+                .map(|(id, port)| test_gateway(id, *port))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn control_center_port_map_assigns_reserved_and_dynamic_ports() {
+        let manifest = test_manifest(&[
+            ("main", 18790),
+            ("gateway-lxgnews", 18791),
+            ("doctor", 18802),
+            ("maliangwriter", 18803),
+            ("lulu-bot", 18795),
+        ]);
+
+        let port_map = build_control_center_port_map(&manifest);
+
+        assert_eq!(port_map.get("main"), Some(&4310));
+        assert_eq!(port_map.get("gateway-lxgnews"), Some(&4311));
+        assert_eq!(port_map.get("doctor"), Some(&4312));
+        assert_eq!(port_map.get("maliangwriter"), Some(&4313));
+        assert_eq!(port_map.get("lulu-bot"), Some(&4314));
+        assert_eq!(preferred_control_center_port(&manifest, "maliangwriter"), 4313);
+        assert_eq!(preferred_control_center_port(&manifest, "lulu-bot"), 4314);
+    }
+
+    #[test]
+    fn control_center_diagnostics_include_dynamic_gateway_details() {
+        let manifest = test_manifest(&[
+            ("main", 18790),
+            ("gateway-lxgnews", 18791),
+            ("doctor", 18802),
+            ("maliangwriter", 18803),
+            ("lulu-bot", 18795),
+        ]);
+        let gateway = manifest
+            .gateways
+            .iter()
+            .find(|gateway| gateway.id == "maliangwriter")
+            .unwrap();
+        let ui_port = preferred_control_center_port(&manifest, &gateway.id);
+        let runtime_dir = control_center_runtime_dir(&gateway.id);
+        let (stdout_path, stderr_path) = control_center_log_paths(&gateway.id);
+        let diagnostics =
+            control_center_diagnostics(gateway, ui_port, &runtime_dir, &stdout_path, &stderr_path);
+
+        assert!(diagnostics.contains("gateway_id=maliangwriter"));
+        assert!(diagnostics.contains("gateway_port=18803"));
+        assert!(diagnostics.contains("ui_port=4313"));
+        assert!(diagnostics.contains(&format!("runtime_dir={}", runtime_dir.display())));
+        assert!(diagnostics.contains(&format!("stdout_log={}", stdout_path.display())));
+        assert!(diagnostics.contains(&format!("stderr_log={}", stderr_path.display())));
+    }
 }
