@@ -6,7 +6,7 @@ use crate::models::{
 };
 use chrono::{DateTime, Utc};
 use log::{info, warn};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -111,7 +111,9 @@ pub async fn create_managed_gateway(
     let workspace_dir = format!("{}/workspace", state_dir);
     let inherit_source =
         select_env_source_gateway(&manifest, request.inherit_env_from.as_deref())?.cloned();
-    let provisioned_channels = materialize_channel_configs(&request.channels)?;
+    let inherited_config = inherit_source.as_ref().and_then(load_gateway_config_json);
+    let provisioned_channels =
+        materialize_channel_configs(&request.channels, inherited_config.as_ref())?;
     let primary_model = normalize_model_id(request.primary_model.as_deref())
         .unwrap_or_else(|| DEFAULT_PRIMARY_MODEL.to_string());
     let fallback_models = normalize_model_list(&request.fallback_models);
@@ -160,7 +162,7 @@ pub async fn create_managed_gateway(
     ])?;
     wait_for_gateway_state(port, "start")?;
 
-    upsert_health_entry_json(
+    if let Err(error) = upsert_health_entry_json(
         &new_gateway.id,
         new_gateway.port,
         &new_gateway.service_name,
@@ -168,7 +170,12 @@ pub async fn create_managed_gateway(
         Some(0),
         Some(0),
         Some("LISTEN".to_string()),
-    )?;
+    ) {
+        warn!(
+            "[Gateways] Failed to persist health cache for {} after creation: {}",
+            new_gateway.id, error
+        );
+    }
 
     let required_ports = manifest
         .gateways
@@ -795,23 +802,15 @@ fn write_gateway_config(
         .map_err(|error| format!("Failed to write gateway config: {}", error))
 }
 
-fn write_gateway_service_unit(gateway: &ManifestGateway, auth_token: &str) -> Result<(), String> {
-    let service_path = wsl_path_to_unc(&format!(
-        "/root/.config/systemd/user/{}",
-        gateway.service_name
-    ));
-    if let Some(parent) = service_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create systemd user dir: {}", error))?;
-    }
-
+fn gateway_service_unit_content(gateway: &ManifestGateway, auth_token: &str) -> String {
     let profile_segment = gateway
         .profile
         .as_ref()
         .map(|profile| format!(" --profile {}", profile))
         .unwrap_or_default();
-    let content = format!(
-        "[Unit]\nDescription={} (OpenClaw {})\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nExecStart=/usr/bin/node {}{} gateway --port {} --bind loopback --token {}\nRestart=always\nRestartSec=5\nTimeoutStopSec=30\nTimeoutStartSec=30\nSuccessExitStatus=0 143\nKillMode=control-group\nEnvironment=HOME=/root\nEnvironment=TMPDIR=/tmp\nEnvironment=PATH={}\nEnvironment=OPENCLAW_STATE_DIR={}\nEnvironment=OPENCLAW_CONFIG_PATH={}/openclaw.json\nEnvironment=OPENCLAW_GATEWAY_PORT={}\nEnvironment=OPENCLAW_SYSTEMD_UNIT={}\nEnvironment=OPENCLAW_SERVICE_MARKER={}\nEnvironment=OPENCLAW_SERVICE_KIND=gateway\nEnvironment=OPENCLAW_SERVICE_VERSION={}\n\n[Install]\nWantedBy=default.target\n",
+
+    format!(
+        "[Unit]\nDescription={} (OpenClaw {})\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nExecStart=/usr/bin/node {}{} gateway --port {} --bind loopback --token {}\nRestart=always\nRestartSec=5\nTimeoutStopSec=30\nTimeoutStartSec=30\nSuccessExitStatus=0 143\nKillMode=control-group\nEnvironment=HOME=/root\nEnvironment=TMPDIR=/tmp\nEnvironment=PATH={}\nEnvironment=NODE_USE_ENV_PROXY=1\nEnvironment=OPENCLAW_STATE_DIR={}\nEnvironment=OPENCLAW_CONFIG_PATH={}/openclaw.json\nEnvironment=OPENCLAW_GATEWAY_PORT={}\nEnvironment=OPENCLAW_SYSTEMD_UNIT={}\nEnvironment=OPENCLAW_SERVICE_MARKER={}\nEnvironment=OPENCLAW_SERVICE_KIND=gateway\nEnvironment=OPENCLAW_SERVICE_VERSION={}\n\n[Install]\nWantedBy=default.target\n",
         gateway.label,
         OPENCLAW_VERSION_TAG,
         OPENCLAW_ENTRYPOINT,
@@ -825,10 +824,56 @@ fn write_gateway_service_unit(gateway: &ManifestGateway, auth_token: &str) -> Re
         gateway.service_name,
         gateway.id,
         OPENCLAW_VERSION_TAG,
-    );
+    )
+}
+
+fn write_gateway_service_unit(gateway: &ManifestGateway, auth_token: &str) -> Result<(), String> {
+    let service_path = wsl_path_to_unc(&format!(
+        "/root/.config/systemd/user/{}",
+        gateway.service_name
+    ));
+    if let Some(parent) = service_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create systemd user dir: {}", error))?;
+    }
+
+    let content = gateway_service_unit_content(gateway, auth_token);
 
     fs::write(service_path, content)
         .map_err(|error| format!("Failed to write systemd unit: {}", error))
+}
+
+fn normalize_gateway_service_drop_in(raw: &str) -> Option<String> {
+    let mut lines = raw
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with("Environment=OPENCLAW_STATE_DIR=")
+                && !trimmed.starts_with("Environment=OPENCLAW_CONFIG_PATH=")
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let meaningful = lines
+        .iter()
+        .any(|line| !line.trim().is_empty() && line.trim() != "[Service]");
+    if !meaningful {
+        return None;
+    }
+
+    if !lines.iter().any(|line| line.trim() == "[Service]") {
+        lines.insert(0, "[Service]".to_string());
+    }
+
+    if !lines
+        .iter()
+        .any(|line| line.trim() == "Environment=NODE_USE_ENV_PROXY=1")
+    {
+        lines.push("Environment=NODE_USE_ENV_PROXY=1".to_string());
+    }
+
+    Some(lines.join("\n"))
 }
 
 fn copy_gateway_service_drop_in(
@@ -849,22 +894,9 @@ fn copy_gateway_service_drop_in(
 
     let raw = fs::read_to_string(source_path)
         .map_err(|error| format!("Failed to read source service drop-in: {}", error))?;
-    let filtered = raw
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !trimmed.starts_with("Environment=OPENCLAW_STATE_DIR=")
-                && !trimmed.starts_with("Environment=OPENCLAW_CONFIG_PATH=")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let meaningful = filtered
-        .lines()
-        .any(|line| !line.trim().is_empty() && line.trim() != "[Service]");
-    if !meaningful {
+    let Some(filtered) = normalize_gateway_service_drop_in(&raw) else {
         return Ok(());
-    }
+    };
 
     let drop_in_dir = wsl_path_to_unc(&format!(
         "/root/.config/systemd/user/{}.d",
@@ -889,6 +921,7 @@ fn validate_gateway_profile(state_dir: &str, profile: &str) -> Result<(), String
 
 fn materialize_channel_configs(
     drafts: &[ManagedGatewayChannelDraft],
+    inherited_config: Option<&Value>,
 ) -> Result<Vec<(String, Value)>, String> {
     if drafts.is_empty() {
         return Err("At least one enabled message channel is required.".to_string());
@@ -940,6 +973,13 @@ fn materialize_channel_configs(
                 config
                     .entry("streaming".to_string())
                     .or_insert_with(|| json!("off"));
+                if !config.contains_key("proxy") {
+                    if let Some(proxy) =
+                        inherited_channel_string(inherited_config, "discord", "proxy")
+                    {
+                        config.insert("proxy".to_string(), json!(proxy));
+                    }
+                }
             }
             _ => {
                 if config.len() <= 1 {
@@ -1082,8 +1122,7 @@ fn upsert_health_entry_json(
     let mut entries = if path.exists() {
         let raw = fs::read_to_string(&path)
             .map_err(|error| format!("Failed to read gateway health file: {}", error))?;
-        serde_json::from_str::<Vec<Value>>(&raw)
-            .map_err(|error| format!("Failed to parse gateway health file: {}", error))?
+        parse_json_array_or_empty::<Value>(&raw, "gateway health file")
     } else {
         Vec::new()
     };
@@ -1122,6 +1161,27 @@ fn upsert_health_entry_json(
         .map_err(|error| format!("Failed to write gateway health file: {}", error))
 }
 
+fn parse_json_array_or_empty<T>(raw: &str, description: &str) -> Vec<T>
+where
+    T: DeserializeOwned,
+{
+    let sanitized = sanitize_json_text(raw).trim();
+    if sanitized.is_empty() {
+        return Vec::new();
+    }
+
+    match serde_json::from_str::<Vec<T>>(sanitized) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(
+                "[Gateways] Failed to parse {}, resetting cached entries: {}",
+                description, error
+            );
+            Vec::new()
+        }
+    }
+}
+
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -1131,9 +1191,7 @@ fn load_health_map() -> HashMap<String, HealthEntry> {
     let Ok(raw) = fs::read_to_string(path) else {
         return HashMap::new();
     };
-    let Ok(entries) = serde_json::from_str::<Vec<HealthEntry>>(sanitize_json_text(&raw)) else {
-        return HashMap::new();
-    };
+    let entries = parse_json_array_or_empty::<HealthEntry>(&raw, "gateway health file");
 
     entries
         .into_iter()
@@ -1198,17 +1256,31 @@ fn read_gateway_service_runtime(gateway: &ManifestGateway) -> GatewayServiceRunt
     }
 }
 
-fn read_gateway_config(gateway: &ManifestGateway) -> GatewayConfigDigest {
+fn load_gateway_config_json(gateway: &ManifestGateway) -> Option<Value> {
     let config_path = wsl_path_to_unc(&wsl_join(&gateway.state_dir, "openclaw.json"));
     let Ok(raw) = fs::read_to_string(config_path) else {
-        return GatewayConfigDigest {
-            notes: vec!["openclaw.json is missing or unreadable.".to_string()],
-            ..GatewayConfigDigest::default()
-        };
+        return None;
     };
     let Ok(config) = serde_json::from_str::<Value>(sanitize_json_text(&raw)) else {
+        return None;
+    };
+
+    Some(config)
+}
+
+fn inherited_channel_string(
+    config: Option<&Value>,
+    channel_type: &str,
+    field: &str,
+) -> Option<String> {
+    let pointer = format!("/channels/{}/{}", channel_type, field);
+    config.and_then(|value| json_string(value, &pointer))
+}
+
+fn read_gateway_config(gateway: &ManifestGateway) -> GatewayConfigDigest {
+    let Some(config) = load_gateway_config_json(gateway) else {
         return GatewayConfigDigest {
-            notes: vec!["openclaw.json could not be parsed.".to_string()],
+            notes: vec!["openclaw.json is missing, unreadable, or invalid.".to_string()],
             ..GatewayConfigDigest::default()
         };
     };
@@ -1762,13 +1834,8 @@ fn spawn_control_center_process(
 ) -> Result<(), String> {
     let log_dir = manager_runtime_dir().join("logs");
     let (stdout_path, stderr_path) = control_center_log_paths(&gateway.id);
-    let diagnostics = control_center_diagnostics(
-        gateway,
-        ui_port,
-        runtime_dir,
-        &stdout_path,
-        &stderr_path,
-    );
+    let diagnostics =
+        control_center_diagnostics(gateway, ui_port, runtime_dir, &stdout_path, &stderr_path);
 
     fs::create_dir_all(runtime_dir).map_err(|error| {
         format!(
@@ -1783,12 +1850,22 @@ fn spawn_control_center_process(
         .create(true)
         .append(true)
         .open(&stdout_path)
-        .map_err(|error| format!("Failed to open control center stdout log: {}. {}", error, diagnostics))?;
+        .map_err(|error| {
+            format!(
+                "Failed to open control center stdout log: {}. {}",
+                error, diagnostics
+            )
+        })?;
     let stderr_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&stderr_path)
-        .map_err(|error| format!("Failed to open control center stderr log: {}. {}", error, diagnostics))?;
+        .map_err(|error| {
+            format!(
+                "Failed to open control center stderr log: {}. {}",
+                error, diagnostics
+            )
+        })?;
 
     let mut command = Command::new("cmd");
     command.args(["/c", "npm.cmd", "run", "dev:ui"]);
@@ -1824,12 +1901,9 @@ fn spawn_control_center_process(
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
 
-    command.spawn().map_err(|error| {
-        format!(
-            "Failed to start control center: {}. {}",
-            error, diagnostics
-        )
-    })?;
+    command
+        .spawn()
+        .map_err(|error| format!("Failed to start control center: {}. {}", error, diagnostics))?;
 
     Ok(())
 }
@@ -2106,7 +2180,10 @@ mod tests {
         assert_eq!(port_map.get("doctor"), Some(&4312));
         assert_eq!(port_map.get("maliangwriter"), Some(&4313));
         assert_eq!(port_map.get("lulu-bot"), Some(&4314));
-        assert_eq!(preferred_control_center_port(&manifest, "maliangwriter"), 4313);
+        assert_eq!(
+            preferred_control_center_port(&manifest, "maliangwriter"),
+            4313
+        );
         assert_eq!(preferred_control_center_port(&manifest, "lulu-bot"), 4314);
     }
 
@@ -2136,5 +2213,79 @@ mod tests {
         assert!(diagnostics.contains(&format!("runtime_dir={}", runtime_dir.display())));
         assert!(diagnostics.contains(&format!("stdout_log={}", stdout_path.display())));
         assert!(diagnostics.contains(&format!("stderr_log={}", stderr_path.display())));
+    }
+
+    #[test]
+    fn parse_json_array_or_empty_returns_empty_for_malformed_health_cache() {
+        let entries =
+            parse_json_array_or_empty::<Value>("\u{feff}{not-json", "gateway health file");
+
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_json_array_or_empty_reads_valid_health_entries() {
+        let entries = parse_json_array_or_empty::<HealthEntry>(
+            r#"[{"id":"main","serviceActive":"active","serviceExitCode":0,"listenerExitCode":0}]"#,
+            "gateway health file",
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "main");
+        assert_eq!(entries[0].service_active.as_deref(), Some("active"));
+        assert_eq!(entries[0].service_exit_code, Some(0));
+        assert_eq!(entries[0].listener_exit_code, Some(0));
+    }
+
+    #[test]
+    fn gateway_service_unit_content_enables_node_proxy_support() {
+        let gateway = test_gateway("lulu-bot", 18795);
+        let content = gateway_service_unit_content(&gateway, "secret-token");
+
+        assert!(content.contains("Environment=NODE_USE_ENV_PROXY=1"));
+        assert!(content.contains("ExecStart=/usr/bin/node"));
+    }
+
+    #[test]
+    fn normalize_gateway_service_drop_in_preserves_proxy_settings_and_adds_node_flag() {
+        let drop_in = normalize_gateway_service_drop_in(
+            "[Service]\nEnvironment=HTTP_PROXY=http://127.0.0.1:10808\nEnvironment=OPENCLAW_STATE_DIR=/root/.openclaw-old\n",
+        )
+        .unwrap();
+
+        assert!(drop_in.contains("[Service]"));
+        assert!(drop_in.contains("Environment=HTTP_PROXY=http://127.0.0.1:10808"));
+        assert!(!drop_in.contains("Environment=OPENCLAW_STATE_DIR=/root/.openclaw-old"));
+        assert!(drop_in.contains("Environment=NODE_USE_ENV_PROXY=1"));
+    }
+
+    #[test]
+    fn materialize_channel_configs_inherits_discord_proxy_from_source_gateway() {
+        let drafts = vec![ManagedGatewayChannelDraft {
+            channel_type: "discord".to_string(),
+            enabled: true,
+            config: json!({
+                "token": "discord-token"
+            }),
+        }];
+        let inherited = json!({
+            "channels": {
+                "discord": {
+                    "proxy": "http://100.76.28.21:11080"
+                }
+            }
+        });
+
+        let channels = materialize_channel_configs(&drafts, Some(&inherited)).unwrap();
+        let discord = channels
+            .iter()
+            .find(|(channel, _)| channel == "discord")
+            .and_then(|(_, config)| config.as_object())
+            .unwrap();
+
+        assert_eq!(
+            discord.get("proxy").and_then(Value::as_str),
+            Some("http://100.76.28.21:11080")
+        );
     }
 }
